@@ -1,16 +1,22 @@
+// src/sockets/socket.js
 import jwt from 'jsonwebtoken';
 import Message from '../models/Message.js';
 import Conversation from '../models/Conversation.js';
+import { setIO } from './io.js';
+import mongoose from 'mongoose';
 
-// Map userId -> Set(socketId)
-const onlineUsers = new Map();
+const onlineUsers = new Map(); // userId -> Set(socketId)
 
 export default function setupSocket(io) {
+  setIO(io);
+
   io.use((socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
       if (!token) return next(new Error('Auth error'));
-      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      // token may be "Bearer <token>" or raw token — handle both
+      const raw = token.startsWith && token.startsWith('Bearer ') ? token.split(' ')[1] : token;
+      const payload = jwt.verify(raw, process.env.JWT_SECRET);
       socket.userId = payload.id;
       next();
     } catch (err) {
@@ -23,59 +29,79 @@ export default function setupSocket(io) {
     if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
     onlineUsers.get(userId).add(socket.id);
 
-    // emit updated online list
+    // join conversation rooms for this user
+    try {
+      const convs = await Conversation.find({ participants: userId }).select('_id').lean();
+      convs.forEach(c => {
+        const room = `conv_${c._id.toString()}`;
+        socket.join(room);
+      });
+    } catch (e) {
+      console.warn('Failed joining conv rooms for user', userId, e.message || e);
+    }
+
+    // emit updated online list (optional)
     io.emit('online_users', Array.from(onlineUsers.keys()));
 
-    // join user's conversation rooms (optional)
-    // can implement: fetch convs and socket.join(convId)
-
+    // handle incoming send_message via socket
     socket.on('send_message', async (payload, ack) => {
+      // payload: { conversationId, text, attachments }
       try {
-        // payload: { conversationId, text, attachments }
+        const { conversationId, text = '', attachments = [] } = payload;
+        if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) {
+          if (ack) ack({ status: 'error', message: 'invalid conversationId' });
+          return;
+        }
+
+        // verify user is participant
+        const conv = await Conversation.findById(conversationId).lean();
+        if (!conv) {
+          if (ack) ack({ status: 'error', message: 'conversation not found' });
+          return;
+        }
+        const me = socket.userId.toString();
+        if (!conv.participants.map(p => p.toString()).includes(me)) {
+          if (ack) ack({ status: 'error', message: 'forbidden' });
+          return;
+        }
+
+        // create message
         const message = await Message.create({
-          conversation: payload.conversationId,
-          from: userId,
-          text: payload.text || '',
-          attachments: payload.attachments || []
+          conversation: conversationId,
+          from: me,
+          text,
+          attachments
         });
 
-        await Conversation.findByIdAndUpdate(payload.conversationId, { lastMessageAt: new Date() });
+        // update conversation lastMessageAt
+        await Conversation.findByIdAndUpdate(conversationId, { lastMessageAt: new Date() });
 
         const populated = await Message.findById(message._id).populate('from', 'username avatarUrl').lean();
 
-        // send to participants
-        const conv = await Conversation.findById(payload.conversationId).lean();
-        const recipients = conv.participants.map(id => id.toString()).filter(id => id !== userId);
-
-        for (const rid of recipients) {
-          const sockets = onlineUsers.get(rid);
-          if (sockets) for (const sid of sockets) io.to(sid).emit('new_message', populated);
-        }
+        // emit to conversation room only
+        const room = `conv_${conversationId}`;
+        io.to(room).emit('new_message', populated);
 
         if (ack) ack({ status: 'ok', message: populated });
       } catch (err) {
-        console.error('send_message error', err);
+        console.error('socket send_message error', err);
         if (ack) ack({ status: 'error' });
       }
     });
 
-    socket.on('mark_read', async ({ conversationId }) => {
-      try {
-        await Message.updateMany({ conversation: conversationId, from: { $ne: userId }, readBy: { $ne: userId } }, { $addToSet: { readBy: userId } });
-        socket.emit('marked_read', { conversationId });
-      } catch (err) { console.error(err); }
+    socket.on('typing', ({ conversationId, isTyping }) => {
+      // broadcast typing to conv room excluding sender
+      if (!conversationId) return;
+      const room = `conv_${conversationId}`;
+      socket.to(room).emit('typing', { conversationId, userId });
     });
 
-    socket.on('typing', ({ conversationId, isTyping }) => {
-      // broadcast typing to other participant(s)
-      Conversation.findById(conversationId).then(conv => {
-        if (!conv) return;
-        const others = conv.participants.map(id => id.toString()).filter(id => id !== userId);
-        for (const rid of others) {
-          const sockets = onlineUsers.get(rid);
-          if (sockets) for (const sid of sockets) io.to(sid).emit('typing', { conversationId, userId, isTyping });
-        }
-      }).catch(err => console.error(err));
+    socket.on('mark_read', async ({ conversationId }) => {
+      try {
+        const me = socket.userId.toString();
+        await Message.updateMany({ conversation: conversationId, from: { $ne: me }, readBy: { $ne: me } }, { $addToSet: { readBy: me } });
+        io.to(`conv_${conversationId}`).emit('marked_read', { conversationId, userId: me });
+      } catch (e) { console.error(e); }
     });
 
     socket.on('disconnect', () => {
